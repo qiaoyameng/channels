@@ -166,4 +166,64 @@ as we only provide async versions:
     If you are using a long running consumer, websocket or long-polling
     HTTP it is possible that the user will be logged out of their session
     elsewhere while your consumer is running. You can periodically use
-    ``get_user(scope)`` to be sure that the user is still logged in.
+    ``get_user(scope)`` to be sure that the user is still logged in, or use
+    the ``SessionRevocationMiddleware`` described below to have connections
+    closed for you.
+
+
+Closing connections when sessions are revoked
+---------------------------------------------
+
+A WebSocket connection resolves ``scope["user"]`` once, when it is
+established. If the user logs out in another browser tab, or an
+administrator deletes their session server-side, the connection would
+otherwise keep running with the stale user. The optional
+``SessionRevocationMiddleware`` closes such connections promptly.
+
+Wrap it inside your session/auth stack (it needs ``scope["session"]`` and a
+channel layer with groups support):
+
+.. code-block:: python
+
+    from channels.auth import AuthMiddleware, SessionRevocationMiddleware
+    from channels.sessions import SessionMiddlewareStack
+
+    application = ProtocolTypeRouter({
+        "websocket": SessionMiddlewareStack(
+            AuthMiddleware(
+                SessionRevocationMiddleware(
+                    URLRouter([...])
+                )
+            )
+        ),
+    })
+
+Each connection subscribes to a channel layer group derived from a hash of
+its own session key only, and revocation messages never contain the raw
+session cookie. Connections without an authenticated session are not
+tracked, and the subscription is removed again when the connection closes.
+If the session key rotates while the connection is open (for example after
+``channels.auth.login``), the subscription follows the new key, and a late
+revocation of the old session does not close the connection.
+
+Revocation is triggered automatically when:
+
+* a user logs out through a regular Django view (via the
+  ``user_logged_out`` signal), or
+* ``channels.auth.logout()`` is called.
+
+To revoke sessions yourself - for example from an admin action or a
+management command that deletes ``Session`` rows - call ``revoke_session``
+(or its async variant ``arevoke_session``) with the session key:
+
+.. code-block:: python
+
+    from channels.auth import revoke_session
+
+    def delete_sessions(modeladmin, request, queryset):
+        for session in queryset:
+            revoke_session(session.session_key)
+            session.delete()
+
+Both helpers are no-ops when no channel layer is configured, so they are
+always safe to call.
