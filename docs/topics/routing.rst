@@ -108,6 +108,51 @@ Please note that ``URLRouter`` nesting will not work properly with
 See `Issue #1428 <https://github.com/django/channels/issues/1428>`__.
 
 
+SubprotocolRouter
+-----------------
+
+``channels.routing.SubprotocolRouter``
+
+Routes ``websocket`` connections based on the subprotocols the client offers
+during the opening handshake (``scope["subprotocols"]``). This is useful when
+a single URL has to serve more than one version or flavour of an application
+and clients select one with a WebSocket subprotocol. It only routes
+``websocket`` scopes; ``http`` scopes passed to it raise ``ValueError``, so
+place it underneath a ``ProtocolTypeRouter`` (or inside a ``URLRouter``).
+
+It takes a single argument - a list of ``(subprotocols, application)`` pairs.
+``subprotocols`` is a single subprotocol string or a list of strings the
+application is willing to speak:
+
+.. code-block:: python
+
+    SubprotocolRouter([
+        ("chat.v2", ChatV2Consumer.as_asgi()),
+        (["chat.v1"], ChatV1Consumer.as_asgi()),
+    ])
+
+The matching rules are:
+
+* The first subprotocol offered by the client (client preference order) that
+  is also configured on one of the pairs selects the application.
+* If that protocol is configured on more than one pair, the first pair in the
+  list wins - the order of your server configuration sets the priority.
+
+The selected application is called with an independent child scope in which
+``subprotocols`` contains only the single negotiated protocol; the chosen
+value is also available directly as ``scope["subprotocol"]``. When the
+application sends ``websocket.accept`` it may only confirm that exact
+subprotocol - accepting with a different one (or with no subprotocol) raises
+``ValueError``. It may still explicitly refuse the handshake by sending
+``websocket.close``. If none of the offered subprotocols match any pair, the
+handshake is rejected with close code ``1002``.
+
+Like the other routers it holds no per-connection state, so the same
+``SubprotocolRouter`` instance can safely serve many connections and
+applications concurrently; scope changes made by the selected application or
+wrapping middleware are confined to that connection's child scope.
+
+
 ChannelNameRouter
 -----------------
 

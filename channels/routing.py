@@ -158,3 +158,133 @@ class ChannelNameRouter:
             raise ValueError(
                 "No application configured for channel name %r" % scope["channel"]
             )
+
+
+class SubprotocolRouter:
+    """
+    Routes ``websocket`` connections to different applications based on the
+    subprotocols offered by the client in ``scope["subprotocols"]``.
+
+    It takes a single argument - a list of ``(subprotocols, application)``
+    pairs. ``subprotocols`` is a single subprotocol string or a list/tuple of
+    strings the application is willing to speak. The order of the pairs is
+    significant: when a client offers several protocols that more than one
+    configured application could serve, the first pair in the list wins:
+
+    .. code-block:: python
+
+        SubprotocolRouter([
+            (["chat.v2"], ChatV2Consumer.as_asgi()),
+            (["chat.v1"], ChatV1Consumer.as_asgi()),
+        ])
+
+    For each connection the first subprotocol offered by the client that is
+    also configured on one of the pairs (client preference order) selects the
+    application. The selected application receives an independent child scope
+    in which ``subprotocols`` contains only the single negotiated protocol
+    (also exposed as ``scope["subprotocol"]``); the router additionally
+    enforces that the application only accepts that exact protocol, or
+    explicitly rejects the connection with ``websocket.close``.
+
+    If none of the offered subprotocols match, the connection is rejected.
+    """
+
+    #: Close code sent back to the client when no configured subprotocol
+    #: intersects with the subprotocols it offered (a protocol error).
+    reject_close_code = 1002
+
+    def __init__(self, routes):
+        self.routes = []
+        for entry in routes:
+            try:
+                subprotocols, application = entry
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "SubprotocolRouter entries must be (subprotocols, "
+                    "application) pairs, got %r." % (entry,)
+                )
+            if isinstance(subprotocols, str):
+                subprotocols = (subprotocols,)
+            normalized = []
+            entry_seen = set()
+            for subprotocol in subprotocols:
+                if not isinstance(subprotocol, str) or not subprotocol:
+                    raise ValueError(
+                        "SubprotocolRouter subprotocols must be non-empty "
+                        "strings, got %r." % (subprotocol,)
+                    )
+                if subprotocol in entry_seen:
+                    raise ValueError(
+                        "Subprotocol %r is configured more than once on the"
+                        " same router entry." % (subprotocol,)
+                    )
+                entry_seen.add(subprotocol)
+                normalized.append(subprotocol)
+            if not normalized:
+                raise ValueError(
+                    "SubprotocolRouter entry %r has no subprotocols." % (entry,)
+                )
+            self.routes.append((normalized, application))
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "websocket":
+            raise ValueError(
+                "SubprotocolRouter can only route 'websocket' scopes, got "
+                "type %r." % scope.get("type")
+            )
+
+        offered = scope.get("subprotocols")
+        if offered is None:
+            offered = []
+
+        # Normalise the client list (de-duplicate while keeping the client's
+        # preference order) without mutating the caller's scope.
+        client_subprotocols = []
+        for subprotocol in offered:
+            if (
+                isinstance(subprotocol, str)
+                and subprotocol not in client_subprotocols
+            ):
+                client_subprotocols.append(subprotocol)
+
+        # Client preference decides which of the offered protocols is picked;
+        # configuration order breaks ties between candidate applications.
+        selected = None
+        application = None
+        for subprotocol in client_subprotocols:
+            for configured, candidate in self.routes:
+                if subprotocol in configured:
+                    selected = subprotocol
+                    application = candidate
+                    break
+            if selected is not None:
+                break
+
+        if selected is None:
+            # No intersection: explicitly reject rather than handing the
+            # connection to an application that cannot serve it.
+            await send({"type": "websocket.close", "code": self.reject_close_code})
+            return
+
+        # Hand the selected application an independent child scope so changes
+        # made by middleware or the application cannot leak back upstream or
+        # into other connections handled concurrently by the same router.
+        child_scope = dict(scope)
+        child_scope["subprotocols"] = [selected]
+        child_scope["subprotocol"] = selected
+
+        async def guarded_send(message):
+            # The application may confirm the negotiated protocol, send data
+            # or explicitly reject/close the connection; it must not confirm
+            # a different (or no) subprotocol.
+            if message["type"] == "websocket.accept":
+                confirmed = message.get("subprotocol")
+                if confirmed != selected:
+                    raise ValueError(
+                        "SubprotocolRouter selected %r but the application "
+                        "tried to accept with subprotocol %r."
+                        % (selected, confirmed)
+                    )
+            await send(message)
+
+        await application(child_scope, receive, guarded_send)

@@ -29,6 +29,10 @@ class WebsocketCommunicator(ApplicationCommunicator):
             self.scope["spec_version"] = spec_version
         super().__init__(application, self.scope)
         self.response_headers = None
+        # The actual negotiation outcome, populated by connect().
+        self.connected = None
+        self.subprotocol = None
+        self.close_code = None
 
     async def connect(self, timeout=1):
         """
@@ -40,11 +44,25 @@ class WebsocketCommunicator(ApplicationCommunicator):
         await self.send_input({"type": "websocket.connect"})
         response = await self.receive_output(timeout)
         if response["type"] == "websocket.close":
-            return (False, response.get("code", 1000))
+            self.connected = False
+            self.close_code = response.get("code", 1000)
+            return (False, self.close_code)
         else:
             assert response["type"] == "websocket.accept"
             self.response_headers = response.get("headers", [])
-            return (True, response.get("subprotocol", None))
+            subprotocol = response.get("subprotocol", None)
+            # The server may only confirm a single subprotocol the client
+            # actually offered (or None); anything else is a protocol error.
+            assert subprotocol is None or subprotocol in (
+                self.scope.get("subprotocols") or []
+            ), (
+                "Server negotiated subprotocol %r which was not offered by "
+                "the client (%r)"
+                % (subprotocol, self.scope.get("subprotocols"))
+            )
+            self.connected = True
+            self.subprotocol = subprotocol
+            return (True, subprotocol)
 
     async def send_to(self, text_data=None, bytes_data=None):
         """
