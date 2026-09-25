@@ -108,7 +108,7 @@ class BaseChannelLayer:
     def __init__(self, expiry=60, capacity=100, channel_capacity=None):
         self.expiry = expiry
         self.capacity = capacity
-        self.channel_capacity = channel_capacity or {}
+        self.channel_capacity = self.compile_capacities(channel_capacity or {})
 
     def compile_capacities(self, channel_capacity):
         """
@@ -273,7 +273,8 @@ class InMemoryChannelLayer(BaseChannelLayer):
         assert "__asgi_channel__" not in message
 
         queue = self.channels.setdefault(
-            channel, asyncio.Queue(maxsize=self.get_capacity(channel))
+            self.non_local_name(channel),
+            asyncio.Queue(maxsize=self.get_capacity(channel)),
         )
         # Add message
         try:
@@ -291,7 +292,8 @@ class InMemoryChannelLayer(BaseChannelLayer):
         self._clean_expired()
 
         queue = self.channels.setdefault(
-            channel, asyncio.Queue(maxsize=self.get_capacity(channel))
+            self.non_local_name(channel),
+            asyncio.Queue(maxsize=self.get_capacity(channel)),
         )
 
         # Do a plain direct receive
@@ -299,7 +301,7 @@ class InMemoryChannelLayer(BaseChannelLayer):
             _, message = await queue.get()
         finally:
             if queue.empty():
-                self.channels.pop(channel, None)
+                self.channels.pop(self.non_local_name(channel), None)
 
         return message
 

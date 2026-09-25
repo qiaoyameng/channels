@@ -85,6 +85,89 @@ async def test_process_local_send_receive(channel_layer):
 
 
 @pytest.mark.asyncio
+async def test_process_local_shared_capacity():
+    """
+    Makes sure process-specific channels sharing a non-local prefix also
+    share its capacity, while different prefixes are independent.
+    """
+    channel_layer = InMemoryChannelLayer(capacity=1)
+    await channel_layer.send("proc!a", {"type": "message.1"})
+    # The shared "proc!" queue is full, even for a different local part.
+    with pytest.raises(ChannelFull):
+        await channel_layer.send("proc!b", {"type": "message.2"})
+    # A different prefix has its own capacity.
+    await channel_layer.send("other!a", {"type": "message.3"})
+    # Receiving by full channel name drains the shared prefix queue.
+    assert (await channel_layer.receive("proc!a"))["type"] == "message.1"
+    # Capacity freed by the receive, so sending now works again.
+    await channel_layer.send("proc!b", {"type": "message.2"})
+    assert (await channel_layer.receive("proc!b"))["type"] == "message.2"
+    assert (await channel_layer.receive("other!a"))["type"] == "message.3"
+    # Queues are cleaned up once empty.
+    assert len(channel_layer.channels) == 0
+
+
+@pytest.mark.asyncio
+async def test_process_local_shared_capacity_expiry():
+    """
+    Makes sure expiry frees shared prefix capacity, interleaved with
+    capacity-one sends and receives.
+    """
+    channel_layer = InMemoryChannelLayer(capacity=1, expiry=0.1)
+    await channel_layer.send("proc!a", {"type": "message.1"})
+    with pytest.raises(ChannelFull):
+        await channel_layer.send("proc!b", {"type": "message.2"})
+
+    await asyncio.sleep(0.15)
+
+    # The expired message is dropped on receive, which then blocks.
+    with pytest.raises(asyncio.TimeoutError):
+        async with async_timeout.timeout(0.5):
+            await channel_layer.receive("proc!a")
+    # Expiry freed the shared capacity.
+    await channel_layer.send("proc!b", {"type": "message.2"})
+    assert (await channel_layer.receive("proc!b"))["type"] == "message.2"
+    assert len(channel_layer.channels) == 0
+
+
+@pytest.mark.asyncio
+async def test_process_local_channel_capacity():
+    """
+    Makes sure channel_capacity patterns apply to the shared prefix queue.
+    """
+    channel_layer = InMemoryChannelLayer(capacity=1, channel_capacity={"proc!*": 2})
+    await channel_layer.send("proc!a", {"type": "message.1"})
+    await channel_layer.send("proc!b", {"type": "message.2"})
+    with pytest.raises(ChannelFull):
+        await channel_layer.send("proc!c", {"type": "message.3"})
+    assert (await channel_layer.receive("proc!a"))["type"] == "message.1"
+    assert (await channel_layer.receive("proc!b"))["type"] == "message.2"
+
+
+@pytest.mark.asyncio
+async def test_process_local_group_send_capacity():
+    """
+    Makes sure group_send drops messages when the shared prefix queue is
+    full, while a direct send reports ChannelFull.
+    """
+    channel_layer = InMemoryChannelLayer(capacity=1)
+    await channel_layer.group_add("test-group", "proc!a")
+    await channel_layer.group_send("test-group", {"type": "message.1"})
+    # Direct send to the same prefix is full and raises.
+    with pytest.raises(ChannelFull):
+        await channel_layer.send("proc!b", {"type": "message.2"})
+    # group_send discards silently instead of raising.
+    await channel_layer.group_send("test-group", {"type": "message.3"})
+    assert (await channel_layer.receive("proc!a"))["type"] == "message.1"
+    # Flush resets the shared prefix queues.
+    await channel_layer.send("proc!a", {"type": "message.4"})
+    await channel_layer.flush()
+    assert len(channel_layer.channels) == 0
+    await channel_layer.send("proc!a", {"type": "message.5"})
+    assert (await channel_layer.receive("proc!a"))["type"] == "message.5"
+
+
+@pytest.mark.asyncio
 async def test_multi_send_receive(channel_layer):
     """
     Tests overlapping sends and receives, and ordering.
