@@ -1,6 +1,14 @@
 Full release notes, with more details and upgrade information, are available at:
 https://channels.readthedocs.io/en/latest/releases
 
+Unreleased
+----------
+
+* Added optional streaming request body support to ``AsyncHttpConsumer``:
+  override ``handle_stream()`` and consume the body chunk by chunk with the
+  ``self.stream_body()`` async iterator. The existing ``handle(body)``
+  behavior is unchanged.
+
 4.3.2 (2025-11-20)
 ------------------
 

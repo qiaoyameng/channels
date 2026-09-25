@@ -4,8 +4,30 @@ import time
 
 import pytest
 
+from channels.exceptions import RequestAborted
 from channels.generic.http import AsyncHttpConsumer
-from channels.testing import HttpCommunicator
+from channels.testing import ApplicationCommunicator, HttpCommunicator
+
+HTTP_SCOPE = {"type": "http", "http_version": "1.1", "method": "POST", "path": "/"}
+
+
+@pytest.fixture
+def noop_connection_cleanup(monkeypatch):
+    """
+    The streaming tests below do not touch the database, so replace the
+    per-message old-connection cleanup (which hops to a worker thread via
+    sync_to_async) with a no-op to keep them self-contained.
+    """
+
+    async def aclose_old_connections():
+        pass
+
+    monkeypatch.setattr(
+        "channels.consumer.aclose_old_connections", aclose_old_connections
+    )
+    monkeypatch.setattr(
+        "channels.generic.http.aclose_old_connections", aclose_old_connections
+    )
 
 
 @pytest.mark.django_db(transaction=True)
@@ -142,3 +164,233 @@ async def test_async_http_consumer_future():
     assert response["body"] == b"42"
     assert response["status"] == 200
     assert response["headers"] == [(b"Content-Type", b"text/plain")]
+
+
+@pytest.mark.asyncio
+async def test_async_http_consumer_streaming(noop_connection_cleanup):
+    """
+    Tests that handle_stream() receives body chunks as they arrive, before
+    the final chunk has been sent.
+    """
+    received = []
+    first_chunk_processed = asyncio.Event()
+
+    class TestConsumer(AsyncHttpConsumer):
+        async def handle_stream(self):
+            async for chunk in self.stream_body():
+                received.append(chunk)
+                if len(received) == 1:
+                    first_chunk_processed.set()
+            await self.send_response(200, b"".join(received))
+
+    communicator = ApplicationCommunicator(TestConsumer(), HTTP_SCOPE)
+    await communicator.send_input(
+        {"type": "http.request", "body": b"first", "more_body": True}
+    )
+    # The first chunk is processed before the last chunk has been sent.
+    await asyncio.wait_for(first_chunk_processed.wait(), timeout=1)
+    assert received == [b"first"]
+
+    await communicator.send_input({"type": "http.request", "body": b"second"})
+    response_start = await communicator.receive_output()
+    assert response_start["type"] == "http.response.start"
+    assert response_start["status"] == 200
+    response_body = await communicator.receive_output()
+    assert response_body["type"] == "http.response.body"
+    assert response_body["body"] == b"firstsecond"
+    await communicator.wait()
+
+
+@pytest.mark.asyncio
+async def test_async_http_consumer_streaming_empty_chunks(noop_connection_cleanup):
+    """
+    Tests that empty chunks and the more_body end-of-body signal are not
+    confused: iteration only stops after a message without more_body.
+    """
+    received = []
+
+    class TestConsumer(AsyncHttpConsumer):
+        async def handle_stream(self):
+            async for chunk in self.stream_body():
+                received.append(chunk)
+            await self.send_response(200, b"done")
+
+    communicator = ApplicationCommunicator(TestConsumer(), HTTP_SCOPE)
+    await communicator.send_input(
+        {"type": "http.request", "body": b"", "more_body": True}
+    )
+    await communicator.send_input(
+        {"type": "http.request", "body": b"", "more_body": True}
+    )
+    await communicator.send_input(
+        {"type": "http.request", "body": b"data", "more_body": True}
+    )
+    await communicator.send_input({"type": "http.request", "body": b""})
+    response_body = await communicator.receive_output()
+    assert response_body["type"] == "http.response.start"
+    response_body = await communicator.receive_output()
+    assert response_body["body"] == b"done"
+    assert received == [b"", b"", b"data", b""]
+    await communicator.wait()
+
+
+@pytest.mark.asyncio
+async def test_async_http_consumer_streaming_empty_body(noop_connection_cleanup):
+    """
+    Tests that a streaming consumer handles a request with an empty body.
+    """
+    received = []
+
+    class TestConsumer(AsyncHttpConsumer):
+        async def handle_stream(self):
+            async for chunk in self.stream_body():
+                received.append(chunk)
+            await self.send_response(200, b"done")
+
+    communicator = ApplicationCommunicator(TestConsumer(), HTTP_SCOPE)
+    await communicator.send_input({"type": "http.request", "body": b""})
+    response_start = await communicator.receive_output()
+    assert response_start["type"] == "http.response.start"
+    response_body = await communicator.receive_output()
+    assert response_body["body"] == b"done"
+    assert received == [b""]
+    await communicator.wait()
+
+
+@pytest.mark.asyncio
+async def test_async_http_consumer_streaming_disconnect(noop_connection_cleanup):
+    """
+    Tests that a client disconnect mid-upload raises RequestAborted in
+    stream_body(), distinguishing it from a cleanly finished body.
+    """
+    outcome = []
+
+    class TestConsumer(AsyncHttpConsumer):
+        def __init__(self):
+            super().__init__()
+            self.disconnect_called = False
+
+        async def handle_stream(self):
+            try:
+                async for chunk in self.stream_body():
+                    pass
+                outcome.append("completed")
+            except RequestAborted:
+                outcome.append("aborted")
+
+        async def disconnect(self):
+            self.disconnect_called = True
+
+    consumer = TestConsumer()
+    communicator = ApplicationCommunicator(consumer, HTTP_SCOPE)
+    await communicator.send_input(
+        {"type": "http.request", "body": b"partial", "more_body": True}
+    )
+    await communicator.send_input({"type": "http.disconnect"})
+    # The consumer exits cleanly on its own.
+    await communicator.wait()
+    assert outcome == ["aborted"]
+    assert consumer.disconnect_called
+
+
+@pytest.mark.asyncio
+async def test_async_http_consumer_streaming_early_response(noop_connection_cleanup):
+    """
+    Tests that if handle_stream() responds without reading the whole body,
+    the remaining consumption is cancelled and the consumer exits without
+    waiting for the rest of the upload.
+    """
+    chunks_read = []
+
+    class TestConsumer(AsyncHttpConsumer):
+        def __init__(self):
+            super().__init__()
+            self.disconnect_called = False
+
+        async def handle_stream(self):
+            async for chunk in self.stream_body():
+                chunks_read.append(chunk)
+                await self.send_response(200, b"early")
+                return
+
+        async def disconnect(self):
+            self.disconnect_called = True
+
+    consumer = TestConsumer()
+    communicator = ApplicationCommunicator(consumer, HTTP_SCOPE)
+    await communicator.send_input(
+        {"type": "http.request", "body": b"one", "more_body": True}
+    )
+    response_start = await communicator.receive_output()
+    assert response_start["type"] == "http.response.start"
+    response_body = await communicator.receive_output()
+    assert response_body["body"] == b"early"
+    # The consumer exits on its own, without waiting for more body messages
+    # and without leaving a receive hanging.
+    await communicator.wait()
+    assert chunks_read == [b"one"]
+    assert consumer.disconnect_called
+
+
+@pytest.mark.asyncio
+async def test_async_http_consumer_streaming_backpressure(noop_connection_cleanup):
+    """
+    Tests that stream_body() only pulls further messages as the caller
+    iterates; at most one chunk is buffered inside the consumer.
+    """
+    first_chunk_read = asyncio.Event()
+    keep_reading = asyncio.Event()
+
+    class TestConsumer(AsyncHttpConsumer):
+        async def handle_stream(self):
+            async for chunk in self.stream_body():
+                first_chunk_read.set()
+                await keep_reading.wait()
+            await self.send_response(200, b"done")
+
+    consumer = TestConsumer()
+    communicator = ApplicationCommunicator(consumer, HTTP_SCOPE)
+    await communicator.send_input(
+        {"type": "http.request", "body": b"1", "more_body": True}
+    )
+    await asyncio.wait_for(first_chunk_read.wait(), timeout=1)
+    # The handler is now paused and not reading further chunks.
+    await communicator.send_input(
+        {"type": "http.request", "body": b"2", "more_body": True}
+    )
+    await communicator.send_input(
+        {"type": "http.request", "body": b"3", "more_body": True}
+    )
+    await communicator.send_input({"type": "http.request", "body": b"4"})
+    # Give the consumer a chance to (not) consume the queued input.
+    await asyncio.sleep(0.1)
+    # At most one chunk is buffered inside the consumer; the rest is still
+    # waiting in the communicator's input queue.
+    assert consumer._stream_queue.qsize() <= 1
+    assert communicator.input_queue.qsize() == 1
+
+    keep_reading.set()
+    response_start = await communicator.receive_output()
+    assert response_start["type"] == "http.response.start"
+    response_body = await communicator.receive_output()
+    assert response_body["body"] == b"done"
+    await communicator.wait()
+
+
+@pytest.mark.asyncio
+async def test_async_http_consumer_streaming_error(noop_connection_cleanup):
+    """
+    Tests that exceptions raised by handle_stream() propagate out of the
+    application.
+    """
+
+    class TestConsumer(AsyncHttpConsumer):
+        async def handle_stream(self):
+            raise AssertionError("Stream error correctly raised")
+
+    communicator = ApplicationCommunicator(TestConsumer(), HTTP_SCOPE)
+    await communicator.send_input({"type": "http.request", "body": b""})
+    with pytest.raises(AssertionError) as excinfo:
+        await communicator.wait()
+
+    assert str(excinfo.value) == "Stream error correctly raised"

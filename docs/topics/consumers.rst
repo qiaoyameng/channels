@@ -353,6 +353,36 @@ disconnect - for example, to shut down any coroutines you launched. This will
 run even on an unclean disconnection, so don't expect that ``handle`` has
 finished running cleanly.
 
+If you do not want to buffer the whole request body in memory - for example
+to process large uploads - override ``handle_stream`` instead of ``handle``
+and consume the body chunk by chunk through ``self.stream_body()``:
+
+.. code-block:: python
+
+    from channels.exceptions import RequestAborted
+    from channels.generic.http import AsyncHttpConsumer
+
+    class UploadConsumer(AsyncHttpConsumer):
+        async def handle_stream(self):
+            size = 0
+            try:
+                async for chunk in self.stream_body():
+                    size += len(chunk)
+            except RequestAborted:
+                # The client went away before the upload finished.
+                return
+            await self.send_response(200, str(size).encode("utf-8"))
+
+``stream_body()`` yields one chunk per incoming ``http.request`` message -
+including empty chunks - and ends once a message without ``more_body`` has
+been yielded. Further messages are only pulled as you iterate, so the body
+is never buffered in its entirety. If the client disconnects before the
+body has been fully received, ``channels.exceptions.RequestAborted`` is
+raised, so an interrupted upload can be told apart from one that finished
+cleanly. If ``handle_stream`` returns before the body is fully consumed -
+for example because the response was sent early - the remaining consumption
+is cancelled and the consumer is closed.
+
 If you need more control over the response, e.g. for implementing long
 polling, use the lower level ``self.send_headers`` and ``self.send_body``
 methods instead. This example already mentions channel layers which will
