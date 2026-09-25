@@ -108,7 +108,7 @@ class BaseChannelLayer:
     def __init__(self, expiry=60, capacity=100, channel_capacity=None):
         self.expiry = expiry
         self.capacity = capacity
-        self.channel_capacity = channel_capacity or {}
+        self.channel_capacity = self.compile_capacities(channel_capacity or {})
 
     def compile_capacities(self, channel_capacity):
         """
@@ -272,14 +272,42 @@ class InMemoryChannelLayer(BaseChannelLayer):
         # name in message
         assert "__asgi_channel__" not in message
 
+        # Expired messages on this channel no longer count towards capacity
+        # and must not block the new message.
+        queue = self.channels.get(channel)
+        if queue is not None:
+            self._purge_expired(channel, queue)
+
+        # Capacity is accounted per non-local part of the channel name, so
+        # process-specific channels sharing a prefix share one capacity pool.
+        # The count is derived from the real queues, not a separate counter.
+        capacity = self.get_capacity(channel)
+        if 0 < capacity <= self._non_local_message_count(channel):
+            raise ChannelFull(channel)
+
         queue = self.channels.setdefault(
-            channel, asyncio.Queue(maxsize=self.get_capacity(channel))
+            channel, asyncio.Queue(maxsize=capacity)
         )
         # Add message
         try:
             queue.put_nowait((time.time() + self.expiry, deepcopy(message)))
         except asyncio.queues.QueueFull:
             raise ChannelFull(channel)
+
+    def _non_local_message_count(self, channel):
+        """
+        Returns the number of pending (unexpired) messages across all channels
+        that share the non-local part of the given channel name.
+        """
+        non_local = self.non_local_name(channel)
+        now = time.time()
+        return sum(
+            1
+            for name, queue in self.channels.items()
+            if self.non_local_name(name) == non_local
+            for message_expiry, _ in queue._queue
+            if message_expiry >= now
+        )
 
     async def receive(self, channel):
         """
@@ -322,14 +350,7 @@ class InMemoryChannelLayer(BaseChannelLayer):
         """
         # Channel cleanup
         for channel, queue in list(self.channels.items()):
-            # See if it's expired
-            while not queue.empty() and queue._queue[0][0] < time.time():
-                queue.get_nowait()
-                # Any removal prompts group discard
-                self._remove_from_groups(channel)
-                # Is the channel now empty and needs deleting?
-                if queue.empty():
-                    self.channels.pop(channel, None)
+            self._purge_expired(channel, queue)
 
         # Group Expiration
         timeout = int(time.time()) - self.group_expiry
@@ -340,6 +361,20 @@ class InMemoryChannelLayer(BaseChannelLayer):
                 if timestamp and timestamp < timeout:
                     # Delete from group
                     channels.pop(name, None)
+
+    def _purge_expired(self, channel, queue):
+        """
+        Removes expired messages from a single channel queue, discarding the
+        channel from all groups and deleting the queue if it empties.
+        """
+        # See if it's expired
+        while not queue.empty() and queue._queue[0][0] < time.time():
+            queue.get_nowait()
+            # Any removal prompts group discard
+            self._remove_from_groups(channel)
+            # Is the channel now empty and needs deleting?
+            if queue.empty():
+                self.channels.pop(channel, None)
 
     # Flush extension
 
