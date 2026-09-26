@@ -348,6 +348,30 @@ method receives the whole request body as a single bytestring.  Headers
 may either be passed as a list of tuples or as a dictionary. The
 response body content is expected to be a bytestring.
 
+If the request body is too large to buffer whole, you can instead implement
+``handle_stream``, which receives the body as an async iterator of
+bytestrings. Further chunks are only pulled from the client as you consume
+them, and the consumer stops as soon as ``handle_stream`` returns, even if
+the body has not been fully received:
+
+.. code-block:: python
+
+    from channels.exceptions import RequestAborted
+    from channels.generic.http import AsyncHttpConsumer
+
+    class UploadConsumer(AsyncHttpConsumer):
+        async def handle_stream(self, stream):
+            try:
+                async for chunk in stream:
+                    ...  # process each chunk as it arrives
+            except RequestAborted:
+                ...  # the client disconnected mid-upload
+            await self.send_response(200, b"Upload complete")
+
+Empty chunks are passed through as ``b""``; the end of the body is only
+signalled by the iterator finishing, and a client disconnect raises
+``RequestAborted`` instead, so the three cases cannot be confused.
+
 You can also implement a ``disconnect`` method if you want to run code on
 disconnect - for example, to shut down any coroutines you launched. This will
 run even on an unclean disconnection, so don't expect that ``handle`` has
