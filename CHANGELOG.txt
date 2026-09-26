@@ -1,6 +1,17 @@
 Full release notes, with more details and upgrade information, are available at:
 https://channels.readthedocs.io/en/latest/releases
 
+Unreleased
+----------
+
+* Added an optional session revocation mechanism. Consumers using the new
+  ``SessionRevocationMixin`` or ``AsyncSessionRevocationMixin`` (from
+  ``channels.auth``) are closed when the session they were opened with is
+  revoked - for example when the user logs out elsewhere, or when
+  ``arevoke_session()``/``revoke_session()`` is called for that session,
+  e.g. from an admin action. Logouts via ``channels.auth.logout()`` and
+  Django's ``user_logged_out`` signal broadcast revocations automatically.
+
 4.3.2 (2025-11-20)
 ------------------
 

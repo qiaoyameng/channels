@@ -167,3 +167,63 @@ as we only provide async versions:
     HTTP it is possible that the user will be logged out of their session
     elsewhere while your consumer is running. You can periodically use
     ``get_user(scope)`` to be sure that the user is still logged in.
+
+
+Closing connections when a session is revoked
+---------------------------------------------
+
+When a user logs out in another browser tab, or an administrator deletes
+their session, any long-running connections that were opened with that
+session keep using the user that was resolved when they connected. Channels
+provides an opt-in mechanism that closes those connections promptly when
+the session is revoked.
+
+Add ``AsyncSessionRevocationMixin`` (or ``SessionRevocationMixin`` for
+sync consumers) to your websocket consumer, and make sure it is wrapped in
+``SessionMiddlewareStack`` or ``AuthMiddlewareStack``:
+
+.. code-block:: python
+
+    from channels.auth import AsyncSessionRevocationMixin
+    from channels.generic.websocket import AsyncWebsocketConsumer
+
+    class ChatConsumer(AsyncSessionRevocationMixin, AsyncWebsocketConsumer):
+        ...
+
+Each connection subscribes to a channel layer group derived from a hash of
+its own session key, so the raw session key (the cookie value) never
+appears in channel layer messages. Because a session can be revoked in the
+gap between the middleware reading it and the connection subscribing, the
+session store is checked once more after subscribing, so no revocation is
+missed. If the session key rotates (for example when the user logs in
+again) the subscription follows the new key, and late revocation notices
+for the old session are ignored, so a fresh login is never closed by an old
+session's revocation. Anonymous connections without a session key are not
+subscribed to anything and are never closed by this mechanism.
+
+Revocations are broadcast automatically when a user logs out, both via
+``channels.auth.logout()`` and via Django's own ``user_logged_out`` signal
+(which covers ``django.contrib.auth.logout()`` in HTTP views). To revoke a
+session yourself - for example from an admin action or a management
+command that deletes sessions - call ``arevoke_session`` (or its sync
+version ``revoke_session``) with the session key:
+
+.. code-block:: python
+
+    from channels.auth import arevoke_session, revoke_session
+
+    # From async code:
+    await arevoke_session(session_key)
+
+    # From sync code:
+    revoke_session(session_key)
+
+The close code used when a connection is closed can be customized by
+setting ``session_revocation_close_code`` on the consumer.
+
+.. note::
+
+    This mechanism requires a channel layer that supports groups, and a
+    session backend that stores sessions server-side (such as the database
+    or cache backends); stateless backends like signed cookies cannot be
+    revoked.
