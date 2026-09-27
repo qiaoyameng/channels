@@ -108,6 +108,61 @@ Please note that ``URLRouter`` nesting will not work properly with
 See `Issue #1428 <https://github.com/django/channels/issues/1428>`__.
 
 
+SubprotocolRouter
+-----------------
+
+``channels.routing.SubprotocolRouter``
+
+Routes ``websocket`` connections based on the subprotocols the client
+offers in the WebSocket handshake (``scope["subprotocols"]``). This lets a
+single URL serve several protocol versions - for example ``chat.v1`` and
+``chat.v2`` - and dispatch each connection to the right application.
+
+It takes a single argument - a dictionary mapping subprotocol names to ASGI
+applications. When the client offers several subprotocols that all have
+applications configured, the one that appears first in the dictionary wins;
+the server's configuration order decides priority, not the client's
+ordering:
+
+.. code-block:: python
+
+    SubprotocolRouter({
+        "chat.v2": chat_v2_app,
+        "chat.v1": chat_v1_app,
+    })
+
+The negotiated subprotocol is placed into a child scope as
+``scope["subprotocol"]`` (the scope you passed in is left unchanged), so the
+routed application always knows which protocol was selected:
+
+.. code-block:: python
+
+    protocol = self.scope["subprotocol"]
+
+The routed application must honour the negotiation when it accepts the
+connection. Accepting without naming a subprotocol confirms the negotiated
+one (the router fills it in on the ``websocket.accept`` message), and
+rejecting the connection with a close is always allowed - but accepting a
+*different* subprotocol raises ``ValueError``.
+
+If none of the offered subprotocols have an application configured,
+``ValueError`` is raised. Non-websocket scopes are also rejected with
+``ValueError``; use ``ProtocolTypeRouter`` above this router to keep HTTP
+traffic away from it:
+
+.. code-block:: python
+
+    application = ProtocolTypeRouter({
+        "http": django_asgi_app,
+        "websocket": URLRouter([
+            path("chat/", SubprotocolRouter({
+                "chat.v2": chat_v2_app,
+                "chat.v1": chat_v1_app,
+            })),
+        ]),
+    })
+
+
 ChannelNameRouter
 -----------------
 

@@ -1,8 +1,16 @@
+import asyncio
+
 import pytest
 from django.core.exceptions import ImproperlyConfigured
 from django.urls import path, re_path
 
-from channels.routing import ChannelNameRouter, ProtocolTypeRouter, URLRouter
+from channels.routing import (
+    ChannelNameRouter,
+    ProtocolTypeRouter,
+    SubprotocolRouter,
+    URLRouter,
+)
+from channels.testing import WebsocketCommunicator
 
 
 class MockApplication:
@@ -312,3 +320,240 @@ def test_invalid_routes():
         URLRouter([path("", include([]))])
 
     assert "include() is not supported in URLRouter." in str(exc)
+
+
+@pytest.mark.asyncio
+async def test_subprotocol_router():
+    """
+    Tests the SubprotocolRouter
+    """
+    v1_app = MockApplication(return_value="v1")
+    v2_app = MockApplication(return_value="v2")
+    router = SubprotocolRouter({"chat.v1": v1_app, "chat.v2": v2_app})
+
+    # Basic routing on the offered subprotocol
+    scope = {"type": "websocket", "subprotocols": ["chat.v1"]}
+    assert await router(scope, None, None) == "v1"
+    # The chosen subprotocol is placed into the child scope...
+    assert v1_app.call_args[0][0]["subprotocol"] == "chat.v1"
+    # ...while the outer scope is left untouched
+    assert "subprotocol" not in scope
+
+    # Server configuration order decides between multiple matches, not the
+    # client's ordering.
+    assert (
+        await router(
+            {"type": "websocket", "subprotocols": ["chat.v2", "chat.v1"]},
+            None,
+            None,
+        )
+        == "v1"
+    )
+    assert (
+        await router(
+            {"type": "websocket", "subprotocols": ["chat.v1", "chat.v2"]},
+            None,
+            None,
+        )
+        == "v1"
+    )
+
+    # Unconfigured subprotocols in the offer are skipped
+    assert (
+        await router(
+            {"type": "websocket", "subprotocols": ["chat.v0", "chat.v2"]},
+            None,
+            None,
+        )
+        == "v2"
+    )
+
+    # Duplicate offers are deduplicated and route predictably
+    assert (
+        await router(
+            {"type": "websocket", "subprotocols": ["chat.v2", "chat.v2"]},
+            None,
+            None,
+        )
+        == "v2"
+    )
+
+    # No intersection
+    with pytest.raises(ValueError):
+        await router({"type": "websocket", "subprotocols": ["chat.v3"]}, None, None)
+    # No subprotocols offered at all
+    with pytest.raises(ValueError):
+        await router({"type": "websocket", "subprotocols": []}, None, None)
+    with pytest.raises(ValueError):
+        await router({"type": "websocket"}, None, None)
+    # HTTP scopes must not enter WebSocket routing
+    with pytest.raises(ValueError):
+        await router({"type": "http", "subprotocols": ["chat.v1"]}, None, None)
+
+
+@pytest.mark.asyncio
+async def test_subprotocol_router_accept_contract():
+    """
+    Tests that SubprotocolRouter enforces the accept contract: applications
+    may confirm the negotiated subprotocol (explicitly or by omission) or
+    reject the connection, but never accept a different subprotocol.
+    """
+    sent_messages = []
+
+    async def send(message):
+        sent_messages.append(message)
+
+    def accept_app(subprotocol):
+        async def app(scope, receive, send):
+            await send({"type": "websocket.accept", "subprotocol": subprotocol})
+
+        return app
+
+    async def close_app(scope, receive, send):
+        await send({"type": "websocket.close", "code": 4404})
+
+    scope = {"type": "websocket", "subprotocols": ["chat.v1"]}
+
+    # Accepting without a subprotocol confirms the negotiated one
+    router = SubprotocolRouter({"chat.v1": accept_app(None)})
+    await router(scope, None, send)
+    assert sent_messages[-1]["subprotocol"] == "chat.v1"
+
+    # Accepting the negotiated subprotocol explicitly is fine
+    router = SubprotocolRouter({"chat.v1": accept_app("chat.v1")})
+    await router(scope, None, send)
+    assert sent_messages[-1]["subprotocol"] == "chat.v1"
+
+    # Accepting a different subprotocol is an error
+    router = SubprotocolRouter({"chat.v1": accept_app("chat.v2")})
+    with pytest.raises(ValueError):
+        await router(scope, None, send)
+
+    # Rejection passes through untouched
+    router = SubprotocolRouter({"chat.v1": close_app})
+    await router(scope, None, send)
+    assert sent_messages[-1] == {"type": "websocket.close", "code": 4404}
+
+
+@pytest.mark.asyncio
+async def test_subprotocol_router_nested_url_router():
+    """
+    Tests that SubprotocolRouter nests with URLRouter in both directions.
+    """
+    inner_app = MockApplication(return_value=1)
+
+    # URLRouter inside SubprotocolRouter
+    router = SubprotocolRouter(
+        {"chat.v1": URLRouter([path("ws/v1/", inner_app)])}
+    )
+    scope = {"type": "websocket", "path": "/ws/v1/", "subprotocols": ["chat.v1"]}
+    assert await router(scope, None, None) == 1
+    assert inner_app.call_args[0][0]["subprotocol"] == "chat.v1"
+    assert inner_app.call_args[0][0]["url_route"] == {"args": (), "kwargs": {}}
+
+    # SubprotocolRouter inside URLRouter
+    router = URLRouter(
+        [path("ws/", SubprotocolRouter({"chat.v2": inner_app}))]
+    )
+    scope = {"type": "websocket", "path": "/ws/", "subprotocols": ["chat.v2"]}
+    assert await router(scope, None, None) == 1
+    assert inner_app.call_args[0][0]["subprotocol"] == "chat.v2"
+
+
+@pytest.mark.asyncio
+async def test_subprotocol_router_middleware_scope_changes():
+    """
+    Tests that middleware modifying the scope around a SubprotocolRouter
+    behaves predictably.
+    """
+    inner_app = MockApplication(return_value=1)
+
+    def additive_middleware(inner):
+        async def app(scope, receive, send):
+            return await inner(dict(scope, user="anne"), receive, send)
+
+        return app
+
+    router = additive_middleware(SubprotocolRouter({"chat.v1": inner_app}))
+    scope = {"type": "websocket", "subprotocols": ["chat.v1"]}
+    assert await router(scope, None, None) == 1
+    # Keys added by middleware are visible to the routed application
+    assert inner_app.call_args[0][0]["user"] == "anne"
+    assert inner_app.call_args[0][0]["subprotocol"] == "chat.v1"
+    # The original scope is not polluted by the router
+    assert "subprotocol" not in scope
+    assert "user" not in scope
+
+    # Middleware that strips the offered subprotocols leads to a
+    # predictable no-match error
+    def stripping_middleware(inner):
+        async def app(scope, receive, send):
+            return await inner(dict(scope, subprotocols=[]), receive, send)
+
+        return app
+
+    router = stripping_middleware(SubprotocolRouter({"chat.v1": inner_app}))
+    with pytest.raises(ValueError):
+        await router({"type": "websocket", "subprotocols": ["chat.v1"]}, None, None)
+
+
+def version_echo_app():
+    """
+    An ASGI app that accepts (letting the router confirm the negotiated
+    subprotocol) and echoes frames back prefixed with the subprotocol it
+    was routed under.
+    """
+
+    async def app(scope, receive, send):
+        await send({"type": "websocket.accept"})
+        while True:
+            message = await receive()
+            if message["type"] == "websocket.receive":
+                await send(
+                    {
+                        "type": "websocket.send",
+                        "text": "%s:%s" % (scope["subprotocol"], message["text"]),
+                    }
+                )
+            elif message["type"] == "websocket.disconnect":
+                return
+
+    return app
+
+
+@pytest.mark.asyncio
+async def test_subprotocol_router_concurrent_versions():
+    """
+    Tests that a single SubprotocolRouter instance can serve two protocol
+    versions concurrently without shared state crosstalk.
+    """
+    router = SubprotocolRouter(
+        {
+            "chat.v1": version_echo_app(),
+            "chat.v2": version_echo_app(),
+        }
+    )
+    communicator_v1 = WebsocketCommunicator(router, "/ws/", subprotocols=["chat.v1"])
+    # The client prefers v2 here; either way only one protocol is negotiated
+    # per connection.
+    communicator_v2 = WebsocketCommunicator(router, "/ws/", subprotocols=["chat.v2"])
+
+    # Connect both concurrently through the same router instance
+    (connected_v1, subprotocol_v1), (connected_v2, subprotocol_v2) = (
+        await asyncio.gather(communicator_v1.connect(), communicator_v2.connect())
+    )
+    assert (connected_v1, subprotocol_v1) == (True, "chat.v1")
+    assert (connected_v2, subprotocol_v2) == (True, "chat.v2")
+    # The communicator records the actual negotiation result for assertions
+    assert communicator_v1.response_subprotocol == "chat.v1"
+    assert communicator_v2.response_subprotocol == "chat.v2"
+
+    # Interleave frames; each connection must only see its own version
+    await communicator_v1.send_to(text_data="hello")
+    await communicator_v2.send_to(text_data="world")
+    await communicator_v1.send_to(text_data="again")
+    assert await communicator_v1.receive_from() == "chat.v1:hello"
+    assert await communicator_v2.receive_from() == "chat.v2:world"
+    assert await communicator_v1.receive_from() == "chat.v1:again"
+
+    await asyncio.gather(communicator_v1.disconnect(), communicator_v2.disconnect())

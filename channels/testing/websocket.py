@@ -29,6 +29,7 @@ class WebsocketCommunicator(ApplicationCommunicator):
             self.scope["spec_version"] = spec_version
         super().__init__(application, self.scope)
         self.response_headers = None
+        self.response_subprotocol = None
 
     async def connect(self, timeout=1):
         """
@@ -44,7 +45,8 @@ class WebsocketCommunicator(ApplicationCommunicator):
         else:
             assert response["type"] == "websocket.accept"
             self.response_headers = response.get("headers", [])
-            return (True, response.get("subprotocol", None))
+            self.response_subprotocol = response.get("subprotocol", None)
+            return (True, self.response_subprotocol)
 
     async def send_to(self, text_data=None, bytes_data=None):
         """

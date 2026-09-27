@@ -136,6 +136,79 @@ class URLRouter:
             raise ValueError("No route found for path %r." % path)
 
 
+class SubprotocolRouter:
+    """
+    Routes WebSocket connections to different applications based on the
+    subprotocols offered by the client in ``scope["subprotocols"]``.
+
+    Takes an ordered mapping of subprotocol names to ASGI applications. When
+    several configured subprotocols are offered by the client at once, the
+    one that appears first in the mapping wins - server configuration order
+    decides priority, not the client's ordering.
+
+    The negotiated subprotocol is placed into a child scope (a copy, so the
+    outer scope is never mutated) as ``scope["subprotocol"]``. The routed
+    application may then only confirm that protocol when it accepts the
+    connection, or reject the connection outright:
+
+    * ``websocket.accept`` without an explicit subprotocol is completed with
+      the negotiated one, so the client always learns the result.
+    * ``websocket.accept`` naming a different subprotocol raises ValueError.
+    * ``websocket.close`` (rejection) is passed through untouched.
+
+    Non-websocket scopes are rejected with ValueError; use ProtocolTypeRouter
+    above this router to keep HTTP traffic away from it.
+    """
+
+    def __init__(self, application_mapping):
+        self.application_mapping = dict(application_mapping)
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "websocket":
+            raise ValueError(
+                "SubprotocolRouter can only route 'websocket' scopes, got "
+                "%r. Use ProtocolTypeRouter to dispatch other protocol "
+                "types." % scope["type"]
+            )
+        # Deduplicate the offered subprotocols (preserving order) so repeated
+        # entries in the client list behave predictably.
+        offered = list(dict.fromkeys(scope.get("subprotocols") or []))
+        for subprotocol, application in self.application_mapping.items():
+            if subprotocol in offered:
+                child_scope = dict(scope, subprotocol=subprotocol)
+                return await application(
+                    child_scope, receive, self._send_wrapper(send, subprotocol)
+                )
+        raise ValueError(
+            "No application configured for any of the offered subprotocols "
+            "%r" % (offered,)
+        )
+
+    @staticmethod
+    def _send_wrapper(send, subprotocol):
+        """
+        Wraps the ASGI send callable to enforce the negotiation contract for
+        a single connection. Created per connection, so concurrent
+        connections through the same router never share state.
+        """
+
+        async def sender(message):
+            if message["type"] == "websocket.accept":
+                accepted = message.get("subprotocol")
+                if accepted is None:
+                    message = dict(message, subprotocol=subprotocol)
+                elif accepted != subprotocol:
+                    raise ValueError(
+                        "SubprotocolRouter negotiated %r but the application "
+                        "tried to accept %r. Applications may only accept "
+                        "the negotiated subprotocol or close the connection."
+                        % (subprotocol, accepted)
+                    )
+            await send(message)
+
+        return sender
+
+
 class ChannelNameRouter:
     """
     Maps to different applications based on a "channel" key in the scope
